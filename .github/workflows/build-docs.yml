@@ -1,162 +1,103 @@
 name: Build docs (doc.typhondb.io)
-
-# Builds the DocFX site and deploys it to GitHub Pages at doc.typhondb.io.
-# PRs build only (verify DocFX compiles + links resolve); pushes to main build AND deploy.
-#
-# The build MUST go through scripts/build-docs.sh, not a bare `docfx docfx.json`:
-# Typhon's public attributes (TraceEvent, BeginParam, ...) are source-generated, so DocFX's
-# own Roslyn compile of the source fails (CS0246). The script instead reads API from the
-# BUILT Shell assemblies (which already ran the generators + carry all transitive deps),
-# weaves the hand-authored API landing into the regenerated api/toc.yml, then renders.
-# Design: claude/design/Misc/documentation-site.md
-#
-# Supersedes the retired build-documentation.yml (dead branches, unpinned global docfx,
-# one-shot build against source, published doc/live).
-
-on:
-  push:
-    branches: [main]
-    paths:
-      - doc/**
-      - src/**/*.cs                       # API reference is generated from the assemblies — keep it fresh
-      - src/**/*.csproj
-      - benchmark/reports/**              # a fresh CI benchmark commit auto-rebuilds the Benchmarks tab
-      - scripts/build-docs.sh
-      - scripts/stage-api-bin.sh
-      - .config/dotnet-tools.json         # pinned DocFX version
-      - .github/workflows/build-docs.yml
-      - coverage/docs-affected-map.json   # the map-integrity gate validates this
-      - scripts/docs-affected.py
-      - scripts/check-doc-links.py        # the link/path lint runs as a gate step below
-  pull_request:
-    branches: [main]
-    paths:
-      - doc/**
-      - src/**/*.cs
-      - src/**/*.csproj
-      - benchmark/reports/**
-      - scripts/build-docs.sh
-      - scripts/stage-api-bin.sh
-      - .config/dotnet-tools.json
-      - .github/workflows/build-docs.yml
-      - coverage/docs-affected-map.json
-      - scripts/docs-affected.py
-      - scripts/check-doc-links.py
-  workflow_dispatch:
-
 permissions:
   contents: read
   pages: write
   id-token: write
-
-# Never cancel an in-progress Pages deployment (would leave the site half-published); let it
-# finish, then run the next. Queued build-only runs are cheap. (GitHub's recommended Pages pattern.)
 concurrency:
   group: pages
   cancel-in-progress: false
-
 jobs:
   build:
-    runs-on: ubuntu-latest              # DocFX + Roslyn are cross-platform; the .sh scripts run natively here
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
-
-      # The telemetry flag reference (doc/feature-set/Observability/telemetry-flags-reference.md +
-      # typhon.telemetry.template.jsonc) is GENERATED from the catalog (src/Typhon.Engine/Observability/
-      # telemetry-flags.jsonc — the single source of truth; the engine's gate fields are generated from it too).
-      # Regenerate and diff:
-      # if the committed artifacts drift from source, fail with the delta rather than publish a
-      # reference that lies. There is no "should we run the generator?" heuristic — the output is a
-      # pure function of the source, so the diff IS the staleness detector and it cannot miss.
-      # Design: claude/design/doc-accuracy-and-generated-artifacts.md
-      - name: Verify generated telemetry reference is up to date
-        run: python3 scripts/gen-telemetry-reference.py --check
-
-      # docs-affected map integrity (Layer-1 gate for issue #490's Layer-2 net). The map
-      # (coverage/docs-affected-map.json) is hand-authored with no generator, so a moved/renamed/
-      # deleted doc page can leave an entry pointing at nothing, silently narrowing the Layer-2
-      # reviewer. --validate is BLOCKING on stale entries (deterministic — a path exists or it does
-      # not) and warn-only on unmapped subsystems (Layer 3's weekly audit is the floor for those).
-      # Issue #512. Design: claude/design/doc-accuracy-and-generated-artifacts.md
-      - name: Verify docs-affected map integrity (no stale entries)
-        run: python3 scripts/docs-affected.py --validate
-
-      # Mechanical doc drift: cited src/ paths resolve, cross-document links land, #anchors match a real
-      # heading. Deliberately BEFORE the .NET/DocFX setup below — it takes about a second, so a moved file
-      # or a stale anchor fails here rather than after several minutes of building an API reference.
-      #
-      # This is the cheap half of the doc-accuracy net. Until it existed both halves were the Layer-2 LLM
-      # reviewer's job, which meant a ~7-minute billed turn to answer questions os.path.exists answers in
-      # milliseconds. The reviewer is now spent only on the semantic class — prose that still links and still
-      # parses but no longer matches the code. Modelled on typhon-claude's check-doc-drift.py, which took the
-      # same split for the knowledge base. Issue #490 Layer 1.
-      - name: Verify doc links and cited source paths resolve
-        run: python3 scripts/check-doc-links.py
-
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 10.0.x
-
-      - name: Restore pinned DocFX (parity with local build)
-        run: dotnet tool restore
-
-      # Builds Typhon.Shell -> its bin carries the 4 public DLLs + XML docs AND every transitive
-      # dependency, so DocFX resolves all references (a library bin omits the NuGet deps).
-      - name: Build Shell (API assemblies + XML docs + transitive deps)
-        run: dotnet build src/Typhon.Shell -c Release
-
-      - name: Build docs (stage API -> docfx metadata into api/ref + build)
-        shell: bash
-        run: |
-          set -o pipefail                       # without this, tee's exit code would mask a docfx failure
-          sh scripts/build-docs.sh Release 2>&1 | tee /tmp/docfx.log
-
-      # Link/xref integrity gate — the deterministic half of the doc-accuracy design.
-      #
-      # Deliberately NOT `--warningsAsErrors`: `docfx metadata` emits two standing
-      # InvalidAssemblyReference warnings (System.IO.Hashing, Microsoft.Bcl.HashCode — transitive
-      # deps absent from .api-bin) that say nothing about doc content and would fail every run.
-      # Gate instead on exactly the classes that make the PUBLISHED site wrong: dead file links,
-      # dangling anchors, and unresolved xrefs. Baseline at the time of writing: zero of these.
-      - name: Gate on broken links / unresolved xrefs
-        shell: bash
-        run: |
-          if grep -nE "InvalidFileLink|InvalidBookmark|UidNotFound|InvalidXref" /tmp/docfx.log; then
-            echo "::error::Docs contain broken links or unresolved xrefs (listed above). Reproduce locally with: sh scripts/build-docs.sh Release"
-            exit 1
-          fi
-          echo "Link/xref integrity: clean."
-
-      # Serve under /latest/ (relocatable — DocFX links are page-relative) so a future switcher can
-      # add /vX.Y/ siblings without moving files. CNAME pins the custom domain; the root redirect sends
-      # doc.typhondb.io/ -> /latest/; .nojekyll stops Pages' Jekyll from dropping underscore-prefixed dirs.
-      - name: Assemble /latest tree + CNAME + root redirect + robots
-        run: |
-          mkdir -p _publish/latest
-          cp -r doc/_site/* _publish/latest/
-          # llms.txt must sit at the HOST ROOT — coding agents probe /llms.txt on the
-          # domain, not under /latest/. (build-docs.sh emitted it into doc/_site, so a
-          # copy also rides along under /latest/ — harmless; some agents probe both.)
-          cp doc/_site/llms.txt _publish/llms.txt
-          echo "doc.typhondb.io" > _publish/CNAME
-          printf '<!doctype html><meta charset="utf-8"><title>Typhon Documentation</title><meta http-equiv="refresh" content="0; url=/latest/"><a href="/latest/">Typhon Documentation</a>' > _publish/index.html
-          # robots.txt must sit at the HOST root (crawlers only read /robots.txt); DocFX emits
-          # sitemap.xml inside the site bundle, which lands under /latest/, so point there.
-          printf 'User-agent: *\nAllow: /\n\nSitemap: https://doc.typhondb.io/latest/sitemap.xml\n' > _publish/robots.txt
-          touch _publish/.nojekyll
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: _publish
-
+    - uses: actions/checkout@v5
+    - name: Verify generated telemetry reference is up to date
+      run: python3 scripts/gen-telemetry-reference.py --check
+    - name: Verify docs-affected map integrity (no stale entries)
+      run: python3 scripts/docs-affected.py --validate
+    - name: Verify doc links and cited source paths resolve
+      run: python3 scripts/check-doc-links.py
+    - uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+    - name: Restore pinned DocFX (parity with local build)
+      run: dotnet tool restore
+    - name: Build Shell (API assemblies + XML docs + transitive deps)
+      run: dotnet build src/Typhon.Shell -c Release
+    - name: Build docs (stage API -> docfx metadata into api/ref + build)
+      shell: bash
+      run: |
+        set -o pipefail                       # without this, tee's exit code would mask a docfx failure
+        sh scripts/build-docs.sh Release 2>&1 | tee /tmp/docfx.log
+    - name: Gate on broken links / unresolved xrefs
+      shell: bash
+      run: |
+        if grep -nE "InvalidFileLink|InvalidBookmark|UidNotFound|InvalidXref" /tmp/docfx.log; then
+          echo "::error::Docs contain broken links or unresolved xrefs (listed above). Reproduce locally with: sh scripts/build-docs.sh Release"
+          exit 1
+        fi
+        echo "Link/xref integrity: clean."
+    - name: Assemble /latest tree + CNAME + root redirect + robots
+      run: "mkdir -p _publish/latest\ncp -r doc/_site/* _publish/latest/\n# llms.txt\
+        \ must sit at the HOST ROOT \u2014 coding agents probe /llms.txt on the\n\
+        # domain, not under /latest/. (build-docs.sh emitted it into doc/_site, so\
+        \ a\n# copy also rides along under /latest/ \u2014 harmless; some agents probe\
+        \ both.)\ncp doc/_site/llms.txt _publish/llms.txt\necho \"doc.typhondb.io\"\
+        \ > _publish/CNAME\nprintf '<!doctype html><meta charset=\"utf-8\"><title>Typhon\
+        \ Documentation</title><meta http-equiv=\"refresh\" content=\"0; url=/latest/\"\
+        ><a href=\"/latest/\">Typhon Documentation</a>' > _publish/index.html\n# robots.txt\
+        \ must sit at the HOST root (crawlers only read /robots.txt); DocFX emits\n\
+        # sitemap.xml inside the site bundle, which lands under /latest/, so point\
+        \ there.\nprintf 'User-agent: *\\nAllow: /\\n\\nSitemap: https://doc.typhondb.io/latest/sitemap.xml\\\
+        n' > _publish/robots.txt\ntouch _publish/.nojekyll\n"
+    - uses: actions/upload-pages-artifact@v3
+      with:
+        path: _publish
+    timeout-minutes: 6
   deploy:
-    # Build-only on PRs; deploy only when main advances.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+    - id: deployment
+      uses: actions/deploy-pages@v5
+    timeout-minutes: 6
+env:
+  PYTHONPATH: /tmp/instr
+  BASH_ENV: /tmp/instr/bash_env.sh
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - doc/**
+    - src/**/*.cs
+    - src/**/*.csproj
+    - benchmark/reports/**
+    - scripts/build-docs.sh
+    - scripts/stage-api-bin.sh
+    - .config/dotnet-tools.json
+    - .github/workflows/build-docs.yml
+    - coverage/docs-affected-map.json
+    - scripts/docs-affected.py
+    - scripts/check-doc-links.py
+  pull_request:
+    branches:
+    - main
+    paths:
+    - doc/**
+    - src/**/*.cs
+    - src/**/*.csproj
+    - benchmark/reports/**
+    - scripts/build-docs.sh
+    - scripts/stage-api-bin.sh
+    - .config/dotnet-tools.json
+    - .github/workflows/build-docs.yml
+    - coverage/docs-affected-map.json
+    - scripts/docs-affected.py
+    - scripts/check-doc-links.py
+  workflow_dispatch: null
